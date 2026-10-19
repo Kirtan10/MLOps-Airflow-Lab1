@@ -1,338 +1,280 @@
-# Airflow lab
+# Customer Segmentation Pipeline with Apache Airflow
 
-- In order to install Airflow using docker you can watch our [Airflow Lab1 Tutorial Video](https://youtu.be/exFSeGUbn4Q?feature=shared)
-- For latest step-by-step instructions, check out this blog - [AirFlow Lab-1](https://www.mlwithramin.com/blog/airflow-lab1)
+An end-to-end machine learning pipeline, orchestrated with **Apache Airflow 3** and running in **Docker**, that groups credit card customers into segments using **K-Means clustering**. The pipeline picks the number of segments automatically with the **elbow method**, evaluates the clusters, and assigns new customers to a segment.
 
-### ML Model
+This project is a modified version of [Airflow Lab 1](https://github.com/raminmohammadi/MLOps/tree/main/Labs/Airflow_Labs/Lab_1) from the MLOps course repository.
 
-This script is designed for data clustering using K-Means clustering and determining the optimal number of clusters using the elbow method. It provides functionality to load data from a CSV file, perform data preprocessing, build and save a K-Means clustering model, and determine the number of clusters based on the elbow method.
+---
 
-#### Prerequisites
+## Table of Contents
 
-Before using this script, make sure you have the following libraries installed:
+- [Overview](#overview)
+- [Key Concepts](#key-concepts)
+- [Modifications from the Original Lab](#modifications-from-the-original-lab)
+- [Pipeline Architecture](#pipeline-architecture)
+- [Dataset](#dataset)
+- [Project Structure](#project-structure)
+- [Setup and Running](#setup-and-running)
+- [Outputs](#outputs)
+- [Results](#results)
+- [Troubleshooting](#troubleshooting)
+- [Credits](#credits)
 
-- pandas
-- scikit-learn (sklearn)
-- kneed
-- pickle
+---
 
-#### Usage
+## Overview
 
-You can use this script to perform K-Means clustering on your dataset as follows:
+| | |
+|---|---|
+| **Orchestration** | Apache Airflow 3 (Docker Compose) |
+| **ML task** | Unsupervised clustering (customer segmentation) |
+| **Model** | K-Means (`scikit-learn`) |
+| **Choosing k** | Elbow method (`kneed`) |
+| **Evaluation** | Silhouette score, cluster sizes, per-segment profiles |
+| **Operators used** | `PythonOperator`, `BashOperator` |
 
-```python
-# Load the data
-data = load_data()
+---
 
-# Preprocess the data
-preprocessed_data = data_preprocessing(data)
+## Key Concepts
 
-# Build and save the clustering model
-sse_values = build_save_model(preprocessed_data, 'clustering_model.pkl')
+**Apache Airflow** is a workflow orchestrator. You define a pipeline as a set of tasks and the order they run in, and Airflow schedules them, runs them, retries failures, and logs every run in a web UI.
 
-# Load the saved model and determine the number of clusters
-result = load_model_elbow('clustering_model.pkl', sse_values)
-print(result)
+**DAG (Directed Acyclic Graph).** A DAG is how Airflow represents a pipeline. Tasks are the nodes, and dependencies are one-directional arrows between them. The graph has no loops, so every run has a clear start and end.
+
+**XCom (cross-communication).** XCom is how Airflow tasks pass small values to each other. A task's return value is stored automatically, and a later task reads it through `.output`. Because XCom lives in Airflow's metadata database, it is meant for small data such as file paths, IDs and metrics, not whole datasets.
+
+**K-Means clustering** splits data into *k* groups by repeatedly assigning each point to its nearest cluster centre and moving each centre to the middle of its group.
+
+**Elbow method.** SSE (the sum of squared distances from points to their cluster centre) always decreases as *k* grows. The "elbow" is the point where adding more clusters stops giving a large improvement, and it is a common choice for *k*.
+
+**Silhouette score** measures how well separated the clusters are, on a scale from −1 to 1. Higher is better.
+
+---
+
+## Modifications from the Original Lab
+
+| Area | Original lab | This version |
+|---|---|---|
+| Model used for predictions | Last model from the loop (k = 49); the elbow result was only printed | Final model trained with the elbow-selected k |
+| Scaling of new data | `test.csv` predicted **unscaled**, although the model was trained on scaled data | Fitted scaler is saved and applied to new data |
+| Data between tasks | Entire dataset pickled and base64-encoded into XCom | Data saved to files; only paths and small values go through XCom |
+| Features | `BALANCE`, `PURCHASES`, `CREDIT_LIMIT` | Adds `PAYMENTS` |
+| k search range | 1–49 | 1–15 |
+| K-Means initialisation | `random` | `k-means++` |
+| Evaluation | None | Silhouette score, cluster sizes and segment profiles |
+| Predictions | First row of `test.csv` only | Every customer in a 5-row `test.csv`, saved to CSV |
+| DAG structure | 4 tasks in a straight line | 7 tasks with parallel branches and a `BashOperator` |
+| DAG settings | Defaults | Explicit `schedule=None`, 1 retry, tags, DAG docs in the UI |
+| Input validation | None | Clear error if required columns are missing |
+
+### Bug fix 1: the wrong model was saved
+
+The original `build_save_model()` trained K-Means for k = 1 … 49 in a loop and saved whatever model was left in the loop variable, which was the **k = 49** model. The elbow method in the next task found the best k but only printed it, so the result was never used.
+
+**Fix:** `compute_sse` builds the elbow curve, and `train_final_model` uses the elbow result to train the model that is saved and used for predictions.
+
+### Bug fix 2: new data was not scaled
+
+K-Means assigns a point to the nearest cluster centre. The centres were learned on features scaled to the 0–1 range, but the test customer was passed in raw units (for example, a credit limit of about 241,000). The distances, and therefore the predicted cluster, were meaningless.
+
+**Fix:** `data_preprocessing` saves the fitted `MinMaxScaler`, and `predict_new_customers` uses it to scale new data before predicting.
+
+### Design improvement: file paths instead of data in XCom
+
+The original lab pushed the whole dataset through XCom as an encoded string. That works for a small CSV but does not scale. This version writes intermediate data to `dags/working_data/` and passes only the file path, which is the standard pattern in production pipelines (where the files would usually live in cloud storage).
+
+---
+
+## Pipeline Architecture
+
+```
+            load_data_task
+                  │
+        data_preprocessing_task
+                  │
+           compute_sse_task
+                  │
+        train_final_model_task
+          ┌───────┴────────┐
+evaluate_model_task   predict_new_customers_task
+          └───────┬────────┘
+        pipeline_summary_task
 ```
 
-#### Functions
+| Task | Operator | What it does | Output passed via XCom |
+|---|---|---|---|
+| `load_data_task` | Python | Reads `file.csv`, validates columns, drops missing values, saves `clean_data.csv` | Path to clean data |
+| `data_preprocessing_task` | Python | Scales features with `MinMaxScaler`; saves `scaler.pkl` and the scaled data | Path to scaled data |
+| `compute_sse_task` | Python | Fits K-Means for k = 1 … 15, records SSE, saves `elbow_curve.csv` | List of SSE values |
+| `train_final_model_task` | Python | Finds the elbow with `kneed`, trains the final model, saves `kmeans_model.pkl` | `{optimal_k, model_path}` |
+| `evaluate_model_task` | Python | Computes the silhouette score, cluster sizes and segment profiles | Metrics dictionary |
+| `predict_new_customers_task` | Python | Scales `test.csv` with the saved scaler and assigns each customer a cluster | List of cluster IDs |
+| `pipeline_summary_task` | Bash | Prints the metrics, profiles and predictions into the task log | — |
 
-1. **load_data():**
-   - *Description:* Loads data from a CSV file, serializes it, and returns the serialized data.
-   - *Usage:*
-     ```python
-     data = load_data()
-     ```
+`evaluate_model_task` and `predict_new_customers_task` both depend only on the trained model, not on each other, so Airflow runs them **in parallel** (fan-out). `pipeline_summary_task` waits for both to finish (fan-in).
 
-2. **data_preprocessing(data)**
-   - *Description:* Deserializes data, performs data preprocessing, and returns serialized clustered data.
-   - *Usage:*
-     ```python
-     preprocessed_data = data_preprocessing(data)
-     ```
+---
 
-3. **build_save_model(data, filename)**
-   - *Description:* Builds a K-Means clustering model, saves it to a file, and returns SSE values.
-   - *Usage:*
-     ```python
-     sse_values = build_save_model(preprocessed_data, 'clustering_model.pkl')
-     ```
+## Dataset
 
-4. **load_model_elbow(filename, sse)**
-   - *Description:* Loads a saved K-Means clustering model and determines the number of clusters using the elbow method.
-   - *Usage:*
-     ```python
-     result = load_model_elbow('clustering_model.pkl', sse_values)
-     ```
-### Airflow Setup
+**`dags/data/file.csv`** contains about 8,950 credit card customers with 18 columns describing their account behaviour. The pipeline uses four of them:
 
-Use Airflow to author workflows as directed acyclic graphs (DAGs) of tasks. The Airflow scheduler executes your tasks on an array of workers while following the specified dependencies.
+| Feature | Description |
+|---|---|
+| `BALANCE` | Amount owed on the account |
+| `PURCHASES` | Total amount spent on purchases |
+| `CREDIT_LIMIT` | Credit limit of the card |
+| `PAYMENTS` | Total amount paid back |
 
-References
+**`dags/data/test.csv`** contains five new customers (`NEW_001` to `NEW_005`) with the same four features. The pipeline assigns each of them to a segment.
 
--   Product - https://airflow.apache.org/
--   Documentation - https://airflow.apache.org/docs/
--   Github - https://github.com/apache/airflow
+---
 
-#### Installation
+## Project Structure
 
-Prerequisites: You should allocate at least 4GB memory for the Docker Engine (ideally 8GB).
-
-Local
-
--   Docker Desktop Running
-
-Cloud
-
--   Linux VM
--   SSH Connection
--   Installed Docker Engine - [Install using the convenience script](https://docs.docker.com/engine/install/ubuntu/#install-using-the-convenience-script)
-
-#### Tutorial
-
-1. Create a new directory
-
-    ```bash
-    mkdir -p ~/app
-    cd ~/app
-    ```
-
-2. Running Airflow in Docker - [Refer](https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#running-airflow-in-docker)
-
-    a. You can check if you have enough memory by running this command
-
-    ```bash
-    docker run --rm "debian:bullseye-slim" bash -c 'numfmt --to iec $(echo $(($(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE))))'
-    ```
-
-    b. Fetch [docker-compose.yaml](https://airflow.apache.org/docs/apache-airflow/2.5.1/docker-compose.yaml)
-
-    ```bash
-    curl -LfO 'https://airflow.apache.org/docs/apache-airflow/2.5.1/docker-compose.yaml'
-    ```
-
-    c. Setting the right Airflow user
-
-    ```bash
-    mkdir -p ./dags ./logs ./plugins ./working_data
-    echo -e "AIRFLOW_UID=$(id -u)" > .env
-    ```
-
-    d. Update the following in docker-compose.yml
-
-    ```bash
-    # Donot load examples
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-
-    # Additional python package
-    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:- pandas }
-
-    # Output dir
-    - ${AIRFLOW_PROJ_DIR:-.}/working_data:/opt/airflow/working_data
-
-    # Change default admin credentials
-    _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow2}
-    _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow2}
-    ```
-
-    e. Initialize the database
-
-    ```bash
-    docker compose up airflow-init
-    ```
-
-    f. Running Airflow
-
-    ```bash
-    docker compose up
-    ```
-
-    Wait until terminal outputs
-
-    `app-airflow-webserver-1  | 127.0.0.1 - - [17/Feb/2023:09:34:29 +0000] "GET /health HTTP/1.1" 200 141 "-" "curl/7.74.0"`
-
-    g. Enable port forwarding
-
-    h. Visit `localhost:8080` login with credentials set on step `2.d`
-
-3. Explore UI and add user `Security > List Users`
-
-4. Create a python script [`dags/sandbox.py`](dags/sandbox.py)
-
-    - BashOperator
-    - PythonOperator
-    - Task Dependencies
-    - Params
-    - Crontab schedules
-
-    You can have n number of scripts inside dags dir
-
-5. Stop docker containers
-
-    ```bash
-    docker compose down
-    ```
-### Airflow DAG Script
-
-This Markdown file provides a detailed explanation of the Python script that defines an Airflow Directed Acyclic Graph (DAG) for a data processing and modeling workflow.
-
-#### Script Overview
-
-The script defines an Airflow DAG named `your_python_dag` that consists of several tasks. Each task represents a specific operation in a data processing and modeling workflow. The script imports necessary libraries, sets default arguments for the DAG, creates PythonOperators for each task, defines task dependencies, and provides command-line interaction with the DAG.
-
-#### Importing Libraries
-
-```python
-# Import necessary libraries and modules
-from airflow import DAG
-from airflow.operators.python_operator import PythonOperator
-from datetime import datetime, timedelta
-from src.lab import load_data, data_preprocessing, build_save_model, load_model_elbow
-from airflow import configuration as conf
 ```
-The script starts by importing the required libraries and modules. Notable imports include the `DAG` and `PythonOperator` classes from the `airflow` package, datetime manipulation functions, and custom functions from the `src.lab` module.
-
-
-
-#### Enable pickle support for XCom, allowing data to be passed between tasks
-```python
-conf.set('core', 'enable_xcom_pickling', 'True')
-```
-
-#### Define default arguments for your DAG
-```python
-default_args = {
-    'owner': 'your_name',
-    'start_date': datetime(2023, 9, 17),
-    'retries': 0,  # Number of retries in case of task failure
-    'retry_delay': timedelta(minutes=5),  # Delay before retries
-}
-```
-Default arguments for the DAG are specified in a dictionary named default_args. These arguments include the DAG owner's name, the start date, the number of retries, and the retry delay in case of task failure.
-
-#### Create a DAG instance named 'your_python_dag' with the defined default arguments
-``` python 
-dag = DAG(
-    'your_python_dag',
-    default_args=default_args,
-    description='Your Python DAG Description',
-    schedule_interval=None,  # Set the schedule interval or use None for manual triggering
-    catchup=False,
-)
-```
-Here, the DAG object dag is created with the name 'your_python_dag' and the specified default arguments. The description provides a brief description of the DAG, and schedule_interval defines the execution schedule (in this case, it's set to None for manual triggering). catchup is set to False to prevent backfilling of missed runs.
-
-
-#### Task to load data, calls the 'load_data' Python function
-``` python 
-load_data_task = PythonOperator(
-    task_id='load_data_task',
-    python_callable=load_data,
-    dag=dag,
-)
-```
-
-#### Task to perform data preprocessing, depends on 'load_data_task'
-```python 
-data_preprocessing_task = PythonOperator(
-    task_id='data_preprocessing_task',
-    python_callable=data_preprocessing,
-    op_args=[load_data_task.output],
-    dag=dag,
-)
-```
-The 'data_preprocessing_task' depends on the 'load_data_task' and calls the data_preprocessing function, which is provided with the output of the 'load_data_task'.
-
-#### Task to build and save a model, depends on 'data_preprocessing_task'
-```python
-build_save_model_task = PythonOperator(
-    task_id='build_save_model_task',
-    python_callable=build_save_model,
-    op_args=[data_preprocessing_task.output, "model.sav"],
-    provide_context=True,
-    dag=dag,
-)
-```
-The 'build_save_model_task' depends on the 'data_preprocessing_task' and calls the build_save_model function. It also provides additional context information and arguments.
-
-#### Task to load a model using the 'load_model_elbow' function, depends on 'build_save_model_task'
-``` python
-load_model_task = PythonOperator(
-    task_id='load_model_task',
-    python_callable=load_model_elbow,
-    op_args=["model.sav", build_save_model_task.output],
-    dag=dag,
-)
-```
-The 'load_model_task' depends on the 'build_save_model_task' and calls the load_model_elbow function with specific arguments.
-
-#### Set task dependencies
-```python
-load_data_task >> data_preprocessing_task >> build_save_model_task >> load_model_task
-```
-Task dependencies are defined using the >> operator. In this case, the tasks are executed in sequence: 'load_data_task' -> 'data_preprocessing_task' -> 'build_save_model_task' -> 'load_model_task'.
-
-#### If this script is run directly, allow command-line interaction with the DAG
-```python
-if __name__ == "__main__":
-    dag.cli()
-```
-- Lastly, the script allows for command-line interaction with the DAG. When the script is run directly, the dag.cli() function is called, providing the ability to trigger and manage the DAG from the command line.
-- This script defines a comprehensive Airflow DAG for a data processing and modeling workflow, with clear task dependencies and default arguments.
-
-### Running an Apache Airflow DAG Pipeline in Docker
-
-This guide provides detailed steps to set up and run an Apache Airflow Directed Acyclic Graph (DAG) pipeline within a Docker container using Docker Compose. The pipeline is named "your_python_dag."
-
-#### Prerequisites
-
-- Docker: Make sure Docker is installed and running on your system.
-
-#### Step 1: Directory Structure
-
-Ensure your project has the following directory structure:
-
-```plaintext
-your_airflow_project/
+.
 ├── dags/
-│   ├── airflow.py     # Your DAG script
-├── src/
-│   ├── lab.py                # Data processing and modeling functions
-├── data/                       # Directory for data (if needed)
-├── docker-compose.yaml         # Docker Compose configuration
+│   ├── airflow.py              # DAG definition
+│   ├── src/
+│   │   ├── __init__.py
+│   │   └── lab.py              # Task functions
+│   ├── data/
+│   │   ├── file.csv            # Training data
+│   │   └── test.csv            # New customers to segment
+│   ├── model/                  # Created at runtime (git-ignored)
+│   └── working_data/           # Created at runtime (git-ignored)
+├── config/                     # Generated airflow.cfg
+├── docker-compose.yaml         # Airflow 3 services
+├── setup.sh                    # Resets the environment and writes .env
+└── README.md
 ```
 
-#### Step 2: Docker Compose Configuration
-Create a docker-compose.yaml file in the project root directory. This file defines the services and configurations for running Airflow in a Docker container.
+---
 
-#### Step 3: Start the Docker containers by running the following command
+## Setup and Running
 
-```plaintext
+### Prerequisites
+
+- **Docker Desktop**, installed and running
+- At least **4 GB of memory** allocated to Docker (8 GB recommended), set under *Docker Desktop → Settings → Resources*
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/Kirtan10/MLOps-Airflow-Lab1.git
+cd MLOps-Airflow-Lab1
+```
+
+### 2. Get the Airflow Docker Compose file
+
+```bash
+curl -LfO 'https://airflow.apache.org/docs/apache-airflow/stable/docker-compose.yaml'
+```
+
+### 3. Configure `docker-compose.yaml`
+
+In the `environment` section under `x-airflow-common`, set:
+
+```yaml
+AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+_PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-scikit-learn kneed}
+```
+
+The first line hides Airflow's example DAGs. The second installs the libraries this pipeline needs when the containers start.
+
+### 4. Prepare the environment
+
+```bash
+bash setup.sh
+```
+
+This script removes any old containers, volumes and logs, recreates the `logs/`, `plugins/` and `config/` folders, and writes your user ID to `.env`, so the files Airflow creates are owned by you.
+
+### 5. Initialise and start Airflow
+
+```bash
+docker compose up airflow-init
 docker compose up
 ```
 
-Wait until you see the log message indicating that the Airflow webserver is running:
+### 6. Open the Airflow UI
 
-```plaintext
-app-airflow-webserver-1 | 127.0.0.1 - - [17/Feb/2023:09:34:29 +0000] "GET /health HTTP/1.1" 200 141 "-" "curl/7.74.0"
+Go to **http://localhost:8080** and log in. The default username and password are both `airflow`.
+
+### 7. Trigger the DAG
+
+1. Find **`Airflow_Lab1_Customer_Segmentation`** in the DAG list.
+2. Click **Trigger**.
+3. Open the run to watch the tasks progress in the Graph view.
+4. Open the **`pipeline_summary_task`** log to see the final results.
+
+You can also run the whole DAG from the command line:
+
+```bash
+docker compose run --rm airflow-cli airflow dags test Airflow_Lab1_Customer_Segmentation
 ```
 
-#### Step 4: Access Airflow Web Interface
-- Open a web browser and navigate to http://localhost:8080.
+### 8. Stop Airflow
 
-- Log in with the credentials set in the .env file or use the default credentials (username: admin, password: admin).
+```bash
+docker compose down
+```
 
-- Once logged in, you'll be on the Airflow web interface.
+---
 
-#### Step 5: Trigger the DAG
-- In the Airflow web interface, navigate to the "DAGs" page.
+## Outputs
 
-- You should see the "your_python_dag" listed.
+After a successful run, these files are created:
 
-- To manually trigger the DAG, click on the "Trigger DAG" button or enable the DAG by toggling the switch to the "On" position.
+| File | Location | Contents |
+|---|---|---|
+| `scaler.pkl` | `dags/model/` | Fitted `MinMaxScaler` |
+| `kmeans_model.pkl` | `dags/model/` | Final K-Means model |
+| `clean_data.csv` | `dags/working_data/` | Data after dropping missing values |
+| `scaled_data.pkl` | `dags/working_data/` | Scaled feature matrix |
+| `elbow_curve.csv` | `dags/working_data/` | SSE for each k |
+| `metrics.json` | `dags/working_data/` | Optimal k, silhouette score, inertia, cluster sizes |
+| `cluster_profiles.csv` | `dags/working_data/` | Mean feature values and size of each cluster |
+| `predictions.csv` | `dags/working_data/` | Assigned cluster for each customer in `test.csv` |
 
-- Monitor the progress of the DAG in the Airflow web interface. You can view logs, task status, and task execution details.
+---
 
-#### Step 6: Pipeline Outputs
+## Results
 
-- Once the DAG completes its execution, check any output or artifacts produced by your functions and tasks. 
+Results from a sample run (values may differ slightly between library versions):
+
+- **Optimal number of clusters:** 4
+- **Silhouette score:** 0.48
+
+| Cluster | Mean balance | Mean purchases | Mean credit limit | Mean payments | Customers |
+|---|---|---|---|---|---|
+| 0 | 4,099 | 1,069 | 6,698 | 2,384 | 1,255 |
+| 1 | 711 | 1,743 | 8,462 | 2,507 | 1,538 |
+| 2 | 7,812 | 3,616 | 12,855 | 6,558 | 430 |
+| 3 | 769 | 594 | 2,318 | 1,021 | 5,726 |
+
+**Interpreting the segments:**
+
+- **Cluster 3: low-activity customers.** This is the largest group, with low limits, balances and spending.
+- **Cluster 1: active spenders.** They spend regularly but keep low balances.
+- **Cluster 0: balance carriers.** They hold high balances relative to their purchases.
+- **Cluster 2: high-value customers.** This small group has high limits, balances and spending.
+
+---
+
+## Troubleshooting
+
+| Problem | Likely cause and fix |
+|---|---|
+| `ModuleNotFoundError: No module named 'kneed'` (or `sklearn`) | The libraries were not installed in the containers. Check `_PIP_ADDITIONAL_REQUIREMENTS` in `docker-compose.yaml`, then restart with `docker compose down` and `docker compose up`. |
+| The DAG does not appear in the UI | It can take a minute for new DAGs to be picked up. If it still does not appear, look for an import error banner at the top of the DAG list. |
+| Containers keep restarting or exit | Docker probably does not have enough memory. Increase it to at least 4 GB in Docker Desktop settings. |
+| Port 8080 is already in use | Stop the other service using the port, or change the port mapping in `docker-compose.yaml`. |
+| Permission errors on `logs/` or `dags/` | Run `bash setup.sh` again so `.env` contains your user ID. |
+
+---
+
+## Credits
+
+Based on Airflow Lab 1 from [raminmohammadi/MLOps](https://github.com/raminmohammadi/MLOps).
